@@ -4,6 +4,11 @@
 
 #pragma once
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+// Forward declaration at file scope (defined in flash_prepare_scheduler.cu).
+extern "C" void fa3_ikp_get_bufs(void**, uint32_t**);
+#endif
+
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -186,8 +191,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
     // IKP: inject device buffer pointers if the profiler is armed.
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-    { extern "C" void fa3_ikp_get_bufs(void**, uint32_t**);
-      fa3_ikp_get_bufs(&params.ikp_events, &params.ikp_counters); }
+    fa3_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
 #endif
 
     // Get the ptr to kernel function.
