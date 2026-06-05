@@ -4,6 +4,10 @@
 
 #pragma once
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+#include <intra_kernel_profiler/trace/trace.cuh>  // IKP device macros + WarpContext
+#endif
+
 #include "cute/tensor.hpp"
 
 #include <cutlass/cutlass.h>
@@ -386,6 +390,20 @@ public:
             scheduler.init_consumer();
             mainloop.mma_init();
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+            // Per-warp circular-buffer context (lives in registers, lane-0 only).
+            // kIkpCap: events per warp (must be power of 2, matches fa3_ikp_arm cap).
+            // kIkpWpb: warps-per-block upper bound (8 = 256 threads; actual may be less).
+            static constexpr uint32_t kIkpCap = 512;
+            static constexpr uint32_t kIkpWpb = 8;
+            using IkpCtx = ::intra_kernel_profiler::trace::WarpContext<kIkpCap, kIkpWpb>;
+            IkpCtx ikp_ctx;
+            ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof{
+                reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
+                params.ikp_counters};
+            IKP_TRACE_CTX_INIT(ikp_ctx);
+#endif
+
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
@@ -394,6 +412,9 @@ public:
                  ) {
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int const bidb = get<2>(block_coord);
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+                IKP_TRACE_REC_B(ikp_ctx, ikp_prof, (uint16_t)bidb);
+#endif
                 SeqlenInfo_t seqlen_info{
                     bidb,
                     get<0>(params.mainloop.shape_Q),
@@ -464,8 +485,14 @@ public:
                     // Write 0 to gO and -inf to gLSE.
                     epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+                IKP_TRACE_REC_E(ikp_ctx, ikp_prof, (uint16_t)bidb);
+#endif
             }
             epilogue.store_tail();
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+            IKP_TRACE_CTX_FLUSH(ikp_ctx, ikp_prof);
+#endif
         }
 
     }

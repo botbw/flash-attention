@@ -272,3 +272,66 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
         });
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IKP (intra-kernel profiler) host API
+// Built only when FLASH_ATTENTION_ENABLE_IKP is defined at compile time.
+// ─────────────────────────────────────────────────────────────────────────────
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+#include <intra_kernel_profiler/trace/trace.cuh>
+#include <string>
+#include <vector>
+
+namespace {
+    intra_kernel_profiler::trace::HostSession g_ikp_sess;
+    bool g_ikp_armed = false;
+    std::vector<std::string> g_ikp_region_names;
+}
+
+extern "C" {
+
+// Allocate device buffers and arm IKP.
+// Must be called BEFORE the kernel launch.
+//   per_warp_cap       : events per warp (power of 2, e.g. 512)
+//   num_ctas           : gridDim.x for the FA3 kernel (typically 132)
+//   threads_per_block  : blockDim.x for the FA3 kernel (typically 128 or 160)
+void fa3_ikp_arm(int per_warp_cap, int num_ctas, int threads_per_block) {
+    g_ikp_sess.init(per_warp_cap, num_ctas, threads_per_block);
+    g_ikp_sess.reset();
+    g_ikp_armed = true;
+}
+
+// Set human-readable names for region IDs (region_id = bidb = sequence index).
+// names[i] is the label for sequence i.  Must be called after fa3_ikp_arm.
+void fa3_ikp_set_region_names(const char** names, int n) {
+    g_ikp_region_names.clear();
+    for (int i = 0; i < n; ++i) g_ikp_region_names.emplace_back(names[i]);
+    g_ikp_sess.set_region_names(g_ikp_region_names);
+}
+
+// Fill *events and *counters with the device pointers from the armed session.
+// Called from run_mha_fwd_ in flash_fwd_launch_template.h before kernel launch.
+void fa3_ikp_get_bufs(void** events, uint32_t** counters) {
+    if (!g_ikp_armed) { *events = nullptr; *counters = nullptr; return; }
+    auto buf = g_ikp_sess.global_buffer();
+    *events   = reinterpret_cast<void*>(buf.events);
+    *counters = buf.counters;
+}
+
+// cudaDeviceSynchronize + write Chrome Trace JSON to path, then disarm.
+// The JSON is directly loadable in Perfetto (ui.perfetto.dev) or chrome://tracing.
+void fa3_ikp_write_trace(const char* path) {
+    cudaDeviceSynchronize();
+    intra_kernel_profiler::trace::TraceWriteOptions opts;
+    opts.scale = 1.0;  // globaltimer is already in nanoseconds on H100/H200
+    g_ikp_sess.write_trace(std::string(path), opts);
+    g_ikp_armed = false;
+}
+
+// Discard the buffered data without writing.
+void fa3_ikp_disarm() {
+    g_ikp_armed = false;
+}
+
+} // extern "C"
+#endif // FLASH_ATTENTION_ENABLE_IKP

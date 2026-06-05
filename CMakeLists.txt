@@ -306,6 +306,15 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         csrc/common
         csrc/cutlass/include)
 
+    # IKP (intra-kernel profiler) support — enabled via env FA3_IKP_INCLUDE
+    # pointing at the IKP include directory (e.g. third_party/intra-kernel-profiler/include).
+    # Usage: FA3_IKP_INCLUDE=<path> python setup.py build_ext --inplace
+    if (DEFINED ENV{FA3_IKP_INCLUDE} AND NOT "$ENV{FA3_IKP_INCLUDE}" STREQUAL "")
+        target_include_directories(_vllm_fa3_C PRIVATE "$ENV{FA3_IKP_INCLUDE}")
+        target_compile_definitions(_vllm_fa3_C PRIVATE FLASH_ATTENTION_ENABLE_IKP)
+        message(STATUS "FA3 IKP enabled: include=$ENV{FA3_IKP_INCLUDE}")
+    endif()
+
     # custom definitions
     target_compile_definitions(_vllm_fa3_C PRIVATE
         FLASHATTENTION_DISABLE_BACKWARD

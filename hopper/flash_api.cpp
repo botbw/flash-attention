@@ -176,6 +176,10 @@ void set_params_fprop(Flash_fwd_params &params,
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
 
+    // IKP disabled by default; fa3_ikp_arm() sets these before launch.
+    params.ikp_events   = nullptr;
+    params.ikp_counters = nullptr;
+
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
