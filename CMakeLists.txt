@@ -258,22 +258,46 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
 
     # --- optional headdim / dtype selection (default: build ALL) ---
     # Restrict which fwd instantiations compile, e.g. to cut build time:
-    #   FA3_HDIMS="128"        FA3_DTYPES="bf16"     (space/comma separated)
+    #   FA3_HDIMS="128"           FA3_DTYPES="bf16 fp16"  (space/comma separated)
     # Core kernels (combine, prepare_scheduler, flash_api) always build.
+    # The corresponding FLASHATTENTION_DISABLE_* defines are also set so that
+    # flash_api.cpp does not emit references to the excluded instantiations.
+    set(_fa3_disable_defines "")
     if (DEFINED ENV{FA3_HDIMS} AND NOT "$ENV{FA3_HDIMS}" STREQUAL "")
         string(REGEX REPLACE "[ ,]+" ";" _fa3_hdims "$ENV{FA3_HDIMS}")
         list(JOIN _fa3_hdims "|" _fa3_hdims_re)
         list(FILTER FA3_GEN_SRCS INCLUDE REGEX "hdim(${_fa3_hdims_re})(_[0-9]+)?_")
         message(STATUS "FA3: restricted headdims -> $ENV{FA3_HDIMS}")
+        foreach(_hdim 64 96 128 192 256)
+            if(NOT "${_hdim}" IN_LIST _fa3_hdims)
+                list(APPEND _fa3_disable_defines "FLASHATTENTION_DISABLE_HDIM${_hdim}")
+            endif()
+        endforeach()
+        # diff-headdim variants (hdim64→256, hdim64→512, hdim192→128) also need guarding
+        if(NOT "64" IN_LIST _fa3_hdims)
+            list(APPEND _fa3_disable_defines "FLASHATTENTION_DISABLE_HDIMDIFF64")
+        endif()
+        if(NOT "192" IN_LIST _fa3_hdims)
+            list(APPEND _fa3_disable_defines "FLASHATTENTION_DISABLE_HDIMDIFF192")
+        endif()
     endif()
     if (DEFINED ENV{FA3_DTYPES} AND NOT "$ENV{FA3_DTYPES}" STREQUAL "")
         string(REGEX REPLACE "[ ,]+" ";" _fa3_dtypes "$ENV{FA3_DTYPES}")
         list(JOIN _fa3_dtypes "|" _fa3_dtypes_re)
         list(FILTER FA3_GEN_SRCS INCLUDE REGEX "_(${_fa3_dtypes_re})_")
         message(STATUS "FA3: restricted dtypes -> $ENV{FA3_DTYPES}")
+        if(NOT "fp16" IN_LIST _fa3_dtypes)
+            list(APPEND _fa3_disable_defines "FLASHATTENTION_DISABLE_FP16")
+        endif()
+        if(NOT "e4m3" IN_LIST _fa3_dtypes)
+            list(APPEND _fa3_disable_defines "FLASHATTENTION_DISABLE_FP8")
+        endif()
     endif()
     list(LENGTH FA3_GEN_SRCS _fa3_nsrc)
     message(STATUS "FA3: building ${_fa3_nsrc} fwd instantiation source(s)")
+    if(_fa3_disable_defines)
+        message(STATUS "FA3: adding disable defines: ${_fa3_disable_defines}")
+    endif()
 
     # For CUDA we set the architectures on a per file basis
     # FaV3 is not yet supported in Blackwell
@@ -322,6 +346,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
 
     # custom definitions
     target_compile_definitions(_vllm_fa3_C PRIVATE
+        ${_fa3_disable_defines}   # headdim/dtype disable guards derived from FA3_HDIMS/FA3_DTYPES
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         # FLASHATTENTION_DISABLE_ALIBI
