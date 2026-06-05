@@ -5,6 +5,7 @@
 #pragma once
 
 #ifdef FLASH_ATTENTION_ENABLE_IKP
+#include <cstdint>  // uint32_t
 // Forward declaration at file scope (defined in flash_prepare_scheduler.cu).
 extern "C" void fa3_ikp_get_bufs(void**, uint32_t**);
 #endif
