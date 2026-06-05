@@ -132,6 +132,10 @@ public:
         EpilogueArguments epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerArguments scheduler{};
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+        void*     ikp_events   = nullptr;   // intra_kernel_profiler::trace::Event* device buf
+        uint32_t* ikp_counters = nullptr;   // per-(block,warp) circular-buffer counters
+#endif
     };
 
     // Kernel entry point API
@@ -140,6 +144,10 @@ public:
         EpilogueParams epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerParams scheduler{};
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+        void*     ikp_events   = nullptr;
+        uint32_t* ikp_counters = nullptr;
+#endif
     };
 
     //
@@ -163,12 +171,17 @@ public:
         CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
 
         cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
-        return {
+        Params p{
             CollectiveMainloop::to_underlying_arguments(args.mainloop),
             CollectiveEpilogue::to_underlying_arguments(args.epilogue),
             hw_info,
             TileScheduler::to_underlying_arguments(args.scheduler)
         };
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+        p.ikp_events   = args.ikp_events;
+        p.ikp_counters = args.ikp_counters;
+#endif
+        return p;
     }
 
     // Computes the kernel launch grid shape based on runtime parameters

@@ -179,21 +179,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
-    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
+    typename AttnKernel::Arguments attn_args{
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
-    });
-
-    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
-    dim3 block_dims = AttnKernel::get_block_shape();
-    int smem_size = AttnKernel::SharedStorageSize;
-    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
-    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
-    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
-    // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
-    // IKP: inject device buffer pointers if the profiler is armed.
+    };
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-    fa3_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
+    // Inject IKP device buffer pointers into the kernel arguments before conversion.
+    fa3_ikp_get_bufs(&attn_args.ikp_events, &attn_args.ikp_counters);
 #endif
+    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(attn_args);
 
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {

@@ -174,12 +174,6 @@ struct Flash_fwd_params : public Qkv_params {
     int cp_rank;
     int *__restrict__ cp_tot_seqused_k;
 
-    // IKP (intra-kernel profiler) tile timing (null = disabled).
-    // Filled by fa3_ikp_arm() before launch; cleared by fa3_ikp_disarm().
-    // events   : intra_kernel_profiler::trace::Event* device buffer
-    // counters : uint32_t* per-(block,warp) circular-buffer counters on device
-    void*     ikp_events;
-    uint32_t* ikp_counters;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
