@@ -4,7 +4,12 @@ project(vllm_flash_attn LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(FA2_ENABLED ON)
+# Disable FA2 via env: FA2_ENABLED=0 (saves significant build time when only FA3 is needed)
+if (DEFINED ENV{FA2_ENABLED} AND "$ENV{FA2_ENABLED}" STREQUAL "0")
+    set(FA2_ENABLED OFF)
+else()
+    set(FA2_ENABLED ON)
+endif()
 set(FA3_ENABLED ON)
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
