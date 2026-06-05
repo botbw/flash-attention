@@ -188,6 +188,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 #endif
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(attn_args);
 
+    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+    dim3 block_dims = AttnKernel::get_block_shape();
+    int smem_size = AttnKernel::SharedStorageSize;
+
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
