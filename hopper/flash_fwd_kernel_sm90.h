@@ -6,6 +6,20 @@
 
 #ifdef FLASH_ATTENTION_ENABLE_IKP
 #include <intra_kernel_profiler/trace/trace.cuh>  // IKP device macros + WarpContext
+// Encode work-tile coords into a 16-bit IKP region id (decoded in fa3_tile_profile.py):
+//   bit15  = producer(load) flag (0=consumer/MMA)
+//   bits7-14 = bidb (batch, 8b)   bits4-6 = head (3b)   bits0-3 = split_idx (4b)
+// bidh_packed is the scheduler's packed bidh (head | split_idx<<16 | num_splits<<24
+// when Split); num_splits is recovered host-side as max(split_idx)+1 per (batch,head).
+__device__ __forceinline__ uint16_t ikp_region_id(bool producer, int bidb, int bidh_packed, bool is_split) {
+    uint32_t bp = reinterpret_cast<uint32_t&>(bidh_packed);
+    int h  = is_split ? int(bp & 0xFFFF)        : bidh_packed;
+    int sp = is_split ? int((bp >> 16) & 0xFF)  : 0;
+    return (uint16_t)((producer ? 0x8000u : 0u)
+                      | ((uint32_t(bidb) & 0xFFu) << 7)
+                      | ((uint32_t(h)    & 0x7u)  << 4)
+                      |  (uint32_t(sp)   & 0xFu));
+}
 #endif
 
 #include "cute/tensor.hpp"
@@ -353,6 +367,20 @@ public:
 
             cutlass::arch::wait_on_dependent_grids();
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+            // Producer (TMA-load) warp gets its own IKP context. Its region ids
+            // carry the producer flag (bit15) via ikp_region_id(producer=true),
+            // so load spans are labelled distinctly from the consumer MMA spans.
+            static constexpr uint32_t kIkpCapP = 512;
+            static constexpr uint32_t kIkpWpbP = 8;
+            using IkpCtxP = ::intra_kernel_profiler::trace::WarpContext<kIkpCapP, kIkpWpbP>;
+            IkpCtxP ikp_ctx_p;
+            ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof_p{
+                reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
+                params.ikp_counters};
+            IKP_TRACE_CTX_INIT(ikp_ctx_p);
+#endif
+
             // Load Q, K, V
             for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
@@ -384,11 +412,21 @@ public:
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+                uint16_t ikp_rid_p = ikp_region_id(/*producer=*/true, get<2>(block_coord), get<1>(block_coord), Split);
+                IKP_TRACE_REC_B(ikp_ctx_p, ikp_prof_p, ikp_rid_p);
+#endif
                 // pipeline_vt won't be used if we don't need to transpose V.
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+                IKP_TRACE_REC_E(ikp_ctx_p, ikp_prof_p, ikp_rid_p);
+#endif
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+            IKP_TRACE_CTX_FLUSH(ikp_ctx_p, ikp_prof_p);
+#endif
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
@@ -426,7 +464,8 @@ public:
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int const bidb = get<2>(block_coord);
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-                IKP_TRACE_REC_B(ikp_ctx, ikp_prof, (uint16_t)bidb);
+                uint16_t ikp_rid = ikp_region_id(/*producer=*/false, bidb, get<1>(block_coord), Split);
+                IKP_TRACE_REC_B(ikp_ctx, ikp_prof, ikp_rid);
 #endif
                 SeqlenInfo_t seqlen_info{
                     bidb,
@@ -499,7 +538,7 @@ public:
                     epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-                IKP_TRACE_REC_E(ikp_ctx, ikp_prof, (uint16_t)bidb);
+                IKP_TRACE_REC_E(ikp_ctx, ikp_prof, ikp_rid);
 #endif
             }
             epilogue.store_tail();
