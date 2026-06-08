@@ -9,15 +9,14 @@
 // Encode work-tile coords into a 16-bit IKP region id (decoded in fa3_tile_profile.py):
 //   bit15  = producer(load) flag (0=consumer/MMA)
 //   bits7-14 = bidb (batch, 8b)   bits4-6 = head (3b)   bits0-3 = split_idx (4b)
-// bidh_packed is the scheduler's packed bidh (head | split_idx<<16 | num_splits<<24
-// when Split); num_splits is recovered host-side as max(split_idx)+1 per (batch,head).
-__device__ __forceinline__ uint16_t ikp_region_id(bool producer, int bidb, int bidh_packed, bool is_split) {
-    uint32_t bp = reinterpret_cast<uint32_t&>(bidh_packed);
-    int h  = is_split ? int(bp & 0xFFFF)        : bidh_packed;
-    int sp = is_split ? int((bp >> 16) & 0xFF)  : 0;
+// Inputs come straight from get_block_coord(): head = get<1> (already unpacked),
+// split_packed = get<3> (= split_idx | num_splits<<8). num_splits is recovered
+// host-side as max(split_idx)+1 per (batch,head).
+__device__ __forceinline__ uint16_t ikp_region_id(bool producer, int bidb, int head, int split_packed) {
+    int sp = split_packed & 0xFF;   // low byte = split_idx (high byte = num_splits)
     return (uint16_t)((producer ? 0x8000u : 0u)
                       | ((uint32_t(bidb) & 0xFFu) << 7)
-                      | ((uint32_t(h)    & 0x7u)  << 4)
+                      | ((uint32_t(head) & 0x7u)  << 4)
                       |  (uint32_t(sp)   & 0xFu));
 }
 #endif
@@ -413,7 +412,7 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-                uint16_t ikp_rid_p = ikp_region_id(/*producer=*/true, get<2>(block_coord), get<1>(block_coord), Split);
+                uint16_t ikp_rid_p = ikp_region_id(/*producer=*/true, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord));
                 IKP_TRACE_REC_B(ikp_ctx_p, ikp_prof_p, ikp_rid_p);
 #endif
                 // pipeline_vt won't be used if we don't need to transpose V.
@@ -464,7 +463,7 @@ public:
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int const bidb = get<2>(block_coord);
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-                uint16_t ikp_rid = ikp_region_id(/*producer=*/false, bidb, get<1>(block_coord), Split);
+                uint16_t ikp_rid = ikp_region_id(/*producer=*/false, bidb, get<1>(block_coord), get<3>(block_coord));
                 IKP_TRACE_REC_B(ikp_ctx, ikp_prof, ikp_rid);
 #endif
                 SeqlenInfo_t seqlen_info{
