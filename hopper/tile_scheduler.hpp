@@ -629,6 +629,7 @@ public:
             //     printf("Before returning, blockIdx.x = %d, threadIdx.x = %d, group_start_tile = %d, batch_idx_in_group = %d, bidb = %d, num_m_blocks = %d, next_tile_idx = %d, group_end_tile = %d, m_blocks_in_group = %d, mh_block = %d, bidh = %d, block = %d\n", blockIdx.x, threadIdx.x, group_start_tile, batch_idx_in_group, bidb, num_m_blocks, next_tile_idx, group_end_tile, m_blocks_in_group, mh_block, bidh, block);
             // }
         }
+#ifdef FLASH_ATTENTION_DEBUG_PRINTF
         // [PATCH] full per-CTA schedule dump: every assigned work tile, decoded.
         // bidh packing (see get_block_coord): low16=head, bits16-23=split_idx, bits24-31=num_splits.
         if (threadIdx.x % cutlass::NumThreadsPerWarp == 0 && bidb < params.num_batch) {
@@ -639,6 +640,7 @@ public:
             printf("[FA3_TILE] cta=%d tile_idx=%d bidb=%d bidh=%d m_block=%d split_idx=%d num_splits=%d\n",
                    int(blockIdx.x), group_start_tile, bidb, bidh_act, block, sp_idx, nsp);
         }
+#endif
         return {group_start_tile, block, bidh, bidb};
     }
 

@@ -344,6 +344,14 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         message(STATUS "FA3 IKP enabled: include=$ENV{FA3_IKP_INCLUDE}")
     endif()
 
+    # Debug printf ([FA3_CFG]/[FA3_SCHED]/[FA3_TILE]) — OFF by default (the device-side
+    # printf, esp. the per-tile [FA3_TILE], is very slow). Enable for schedule dumps:
+    #   FA3_DEBUG_PRINT=1 python setup.py build_ext --inplace
+    if (DEFINED ENV{FA3_DEBUG_PRINT} AND "$ENV{FA3_DEBUG_PRINT}" STREQUAL "1")
+        target_compile_definitions(_vllm_fa3_C PRIVATE FLASH_ATTENTION_DEBUG_PRINTF)
+        message(STATUS "FA3 debug printf enabled (FA3_CFG/FA3_SCHED/FA3_TILE)")
+    endif()
+
     # custom definitions
     target_compile_definitions(_vllm_fa3_C PRIVATE
         ${_fa3_disable_defines}   # headdim/dtype disable guards derived from FA3_HDIMS/FA3_DTYPES

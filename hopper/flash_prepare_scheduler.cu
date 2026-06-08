@@ -197,18 +197,21 @@ __global__ void prepare_varlen_num_blocks_kernel(
             prepare_seqlen_q_ptr[batch_idx] = batch_coords[0].y * (packgqa ? qhead_per_khead : 1);
             if(num_splits_dynamic_ptr) { num_splits_dynamic_ptr[batch_idx] = batch_coords[0].z; }
             varlen_batch_idx_ptr[batch_idx] = batch_coords[0].w;
+#ifdef FLASH_ATTENTION_DEBUG_PRINTF
             // [PATCH] print scheduler metadata (Sort path: stored in virtual-batch order)
             printf("[FA3_SCHED Sort] virt_batch=%d orig_batch=%d prepare_seqlen_q=%d num_splits=%d num_n_blocks_per_split=%d\n",
                 batch_idx, batch_coords[0].w,
                 batch_coords[0].y * (packgqa ? qhead_per_khead : 1),
                 batch_coords[0].z,
                 batch_coords[0].x);
+#endif
         }
     } else {
         if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
             prepare_seqlen_q_ptr[batch_idx] = seqlen_q * (packgqa ? qhead_per_khead : 1);
             if(num_splits_dynamic_ptr) { num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic; }
             if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1)); }
+#ifdef FLASH_ATTENTION_DEBUG_PRINTF
             // [PATCH] print scheduler metadata (non-Sort path: stored in original-batch order)
             printf("[FA3_SCHED] batch=%d prepare_seqlen_q=%d num_splits_dynamic=%d num_n_blocks_per_split=%d num_splits_static=%d total_blocks=%d blocks_per_sm=%d\n",
                 bidb_start + lane,
@@ -218,6 +221,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
                 num_splits_static,
                 total_blocks_smem[0],
                 static_cast<int>(ceilf(float(total_blocks_smem[0]) * 1.1f * float(num_head) / float(num_sm))));
+#endif
         }
     }
     
@@ -241,6 +245,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
     int const size_one_kvblock = blockN * (params.d + params.dv) * element_size;
     // printf("block size = %d, element size = %d, headdim = %d, headdim_v = %d, size 1 kblock = %d.\n", blockN, element_size, params.d, params.dv, size_one_kvblock);
     int const max_kvblocks_in_l2 = size_l2 / size_one_kvblock;
+#ifdef FLASH_ATTENTION_DEBUG_PRINTF
     // [PATCH] host-side full kernel configuration (printed once per attention call)
     printf("[FA3_CFG] b=%d h=%d h_k=%d gqa=%d d=%d dv=%d seqlen_q=%d seqlen_k=%d "
            "kBlockM=%d kBlockN=%d num_splits_static=%d num_sm=%d is_causal=%d "
@@ -251,6 +256,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
            params.num_sm, (int)params.is_causal, (int)params.pack_gqa, (int)packgqa,
            (int)params.is_e4m3, (int)(params.page_table != nullptr), params.page_size,
            params.num_pages, (int)params.varlen_sort_batches, max_kvblocks_in_l2);
+#endif
     BOOL_SWITCH(params.varlen_sort_batches, Sort, [&] {
         NUM_WARP_SWITCH(num_warps, NumWarps, [&] {
             flash::prepare_varlen_num_blocks_kernel<NumWarps, Sort><<<num_ctas /*grid*/, 32 * NumWarps /*block*/, 0, stream>>>(
