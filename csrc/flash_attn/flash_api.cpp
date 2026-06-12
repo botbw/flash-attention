@@ -253,6 +253,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     });
 }
 
+
+// [IKP] host API lives in src/flash_fwd_ikp_host.cu (needs nvcc); we only
+// need the buffer getter here.
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+extern "C" void fa2_ikp_get_bufs(void** events, uint32_t** counters);
+#endif
+
 // Find the number of splits that maximizes the occupancy. For example, if we have
 // batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
 // better than having 3 splits (efficiency = 0.67). However, we also don't want too many
@@ -496,6 +503,11 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+    fa2_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
+#endif
+
         run_mha_fwd(params, stream);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -742,6 +754,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+    fa2_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
+#endif
+
         run_mha_fwd(params, stream, paged_KV);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1493,6 +1510,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
     // or paged KV cache
+
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+    fa2_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
+#endif
+
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
 
     if (head_size_og % 8 != 0) {

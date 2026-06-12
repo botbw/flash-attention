@@ -4,6 +4,11 @@
 
 #pragma once
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+#include <intra_kernel_profiler/trace/trace.cuh>
+#include <intra_kernel_profiler/trace/macros.cuh>
+#endif
+
 #include "namespace_config.h"
 #include "philox_unpack.cuh" // For at::cuda::philox::unpack
 
@@ -1117,7 +1122,31 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+    // [IKP] one span per CTA = one (seq, head, split) work tile.  Region id
+    // uses the FA3-compatible packing: bidb<<7 | head<<4 | split (4-bit split).
+    static constexpr uint32_t kIkpCap = 8;     // 2 events/warp is enough; pow2
+    static constexpr uint32_t kIkpWpb = 8;
+    using IkpCtx = ::intra_kernel_profiler::trace::WarpContext<kIkpCap, kIkpWpb>;
+    IkpCtx ikp_ctx;
+    ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof{
+        reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
+        params.ikp_counters};
+    const uint16_t ikp_rid = (uint16_t)(((uint32_t(bidb) & 0xFFu) << 7)
+                                        | ((uint32_t(bidh) & 0x7u) << 4)
+                                        | (uint32_t(n_split_idx) & 0xFu));
+    if (params.ikp_events != nullptr) {
+        IKP_TRACE_CTX_INIT(ikp_ctx);
+        IKP_TRACE_REC_B(ikp_ctx, ikp_prof, ikp_rid);
+    }
+#endif
     FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+    if (params.ikp_events != nullptr) {
+        IKP_TRACE_REC_E(ikp_ctx, ikp_prof, ikp_rid);
+        IKP_TRACE_CTX_FLUSH(ikp_ctx, ikp_prof);
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

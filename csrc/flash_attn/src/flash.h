@@ -47,6 +47,11 @@ struct Qkv_params {
 
 struct Flash_fwd_params : public Qkv_params {
 
+    // [IKP] intra-kernel profiler global buffers (null when disarmed).
+    void * ikp_events = nullptr;
+    uint32_t * ikp_counters = nullptr;
+
+
     // The O matrix (output).
     void * __restrict__ o_ptr;
     void * __restrict__ oaccum_ptr;

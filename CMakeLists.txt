@@ -169,6 +169,14 @@ if (FA2_ENABLED)
         csrc/common
         csrc/cutlass/include)
 
+    # IKP (intra-kernel profiler) — enabled via env FA2_IKP_INCLUDE pointing
+    # at the IKP include dir (e.g. ~/intra-kernel-profiler/include).
+    if (DEFINED ENV{FA2_IKP_INCLUDE} AND NOT "$ENV{FA2_IKP_INCLUDE}" STREQUAL "")
+        target_include_directories(_vllm_fa2_C PRIVATE "$ENV{FA2_IKP_INCLUDE}")
+        target_compile_definitions(_vllm_fa2_C PRIVATE FLASH_ATTENTION_ENABLE_IKP)
+        message(STATUS "FA2 IKP enabled: include=$ENV{FA2_IKP_INCLUDE}")
+    endif()
+
     # custom definitions
     target_compile_definitions(_vllm_fa2_C PRIVATE
         FLASHATTENTION_DISABLE_BACKWARD

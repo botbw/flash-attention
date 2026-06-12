@@ -39,3 +39,4 @@ venv
 
 # compile-time generated file
 flash_attn_config.py
+vllm_flash_attn/*.so
