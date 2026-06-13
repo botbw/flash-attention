@@ -1108,7 +1108,33 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+    // [IKP] one span per CTA = one (seq, head, m_block) query-tile of the REGULAR
+    // (non-split) prefill kernel.  Region id packs bidb<<14 | head<<9 | m_block
+    // (2-bit batch, 5-bit head, 9-bit m_block) so the causal-triangle work
+    // profile and the m-fastest dispatch order are recoverable from the trace.
+    static constexpr uint32_t kIkpCap = 8;
+    static constexpr uint32_t kIkpWpb = 8;
+    using IkpCtx = ::intra_kernel_profiler::trace::WarpContext<kIkpCap, kIkpWpb>;
+    IkpCtx ikp_ctx;
+    ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof{
+        reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
+        params.ikp_counters};
+    const uint16_t ikp_rid = (uint16_t)(((uint32_t(bidb) & 0x3u) << 14)
+                                        | ((uint32_t(bidh) & 0x1Fu) << 9)
+                                        | (uint32_t(m_block) & 0x1FFu));
+    if (params.ikp_events != nullptr) {
+        IKP_TRACE_CTX_INIT(ikp_ctx);
+        IKP_TRACE_REC_B(ikp_ctx, ikp_prof, ikp_rid);
+    }
+#endif
     FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+    if (params.ikp_events != nullptr) {
+        IKP_TRACE_REC_E(ikp_ctx, ikp_prof, ikp_rid);
+        IKP_TRACE_CTX_FLUSH(ikp_ctx, ikp_prof);
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
