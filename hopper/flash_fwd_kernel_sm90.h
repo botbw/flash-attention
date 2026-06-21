@@ -6,19 +6,7 @@
 
 #ifdef FLASH_ATTENTION_ENABLE_IKP
 #include <intra_kernel_profiler/trace/trace.cuh>  // IKP device macros + WarpContext
-// Encode work-tile coords into a 16-bit IKP region id (decoded in fa3_tile_profile.py):
-//   bit15  = producer(load) flag (0=consumer/MMA)
-//   bits7-14 = bidb (batch, 8b)   bits4-6 = head (3b)   bits0-3 = split_idx (4b)
-// Inputs come straight from get_block_coord(): head = get<1> (already unpacked),
-// split_packed = get<3> (= split_idx | num_splits<<8). num_splits is recovered
-// host-side as max(split_idx)+1 per (batch,head).
-__device__ __forceinline__ uint16_t ikp_region_id(bool producer, int bidb, int head, int split_packed) {
-    int sp = split_packed & 0xFF;   // low byte = split_idx (high byte = num_splits)
-    return (uint16_t)((producer ? 0x8000u : 0u)
-                      | ((uint32_t(bidb) & 0xFFu) << 7)
-                      | ((uint32_t(head) & 0x7u)  << 4)
-                      |  (uint32_t(sp)   & 0xFu));
-}
+#include "ikp_region.h"                            // flash::ikp_region_id (shared w/ mainloop)
 #endif
 
 #include "cute/tensor.hpp"
@@ -370,8 +358,8 @@ public:
             // Producer (TMA-load) warp gets its own IKP context. Its region ids
             // carry the producer flag (bit15) via ikp_region_id(producer=true),
             // so load spans are labelled distinctly from the consumer MMA spans.
-            static constexpr uint32_t kIkpCapP = 512;
-            static constexpr uint32_t kIkpWpbP = 8;
+            static constexpr uint32_t kIkpCapP = 32768;   // full per-iteration phase tagging -> ~18 events/iter
+            static constexpr uint32_t kIkpWpbP = 16;   // cover up to 16 warps/block (mixed = 12)
             using IkpCtxP = ::intra_kernel_profiler::trace::WarpContext<kIkpCapP, kIkpWpbP>;
             IkpCtxP ikp_ctx_p;
             ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof_p{
@@ -413,13 +401,15 @@ public:
                 };
 #ifdef FLASH_ATTENTION_ENABLE_IKP
                 uint16_t ikp_rid_p = ikp_region_id(/*producer=*/true, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord));
-                IKP_TRACE_REC_B(ikp_ctx_p, ikp_prof_p, ikp_rid_p);
-#endif
+                IKP_TRACE_REC_IF(ikp_ctx_p, ikp_prof_p, ikp_rid_p, 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0));
                 // pipeline_vt won't be used if we don't need to transpose V.
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
+                                         (void*)&ikp_ctx_p, ikp_prof_p, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord));
+                IKP_TRACE_REC_IF(ikp_ctx_p, ikp_prof_p, ikp_rid_p, 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0));
+#else
+                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
-#ifdef FLASH_ATTENTION_ENABLE_IKP
-                IKP_TRACE_REC_E(ikp_ctx_p, ikp_prof_p, ikp_rid_p);
 #endif
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
@@ -443,9 +433,12 @@ public:
 #ifdef FLASH_ATTENTION_ENABLE_IKP
             // Per-warp circular-buffer context (lives in registers, lane-0 only).
             // kIkpCap: events per warp (must be power of 2, matches fa3_ikp_arm cap).
-            // kIkpWpb: warps-per-block upper bound (8 = 256 threads; actual may be less).
-            static constexpr uint32_t kIkpCap = 512;
-            static constexpr uint32_t kIkpWpb = 8;
+            // kIkpWpb: warps-per-block upper bound. MUST cover the max warp index in the
+            // block: mixed/prefill uses 2 MMA WGs + 1 producer WG = 12 warps (w up to 11),
+            // so 8 overflowed consumer warps 8-11 into adjacent blocks. 16 covers it (and
+            // decode's 8). Host fa3_ikp_arm must pass threads_per_block=512 to match (WPB=16).
+            static constexpr uint32_t kIkpCap = 32768;   // full per-iteration phase tagging -> ~18 events/iter
+            static constexpr uint32_t kIkpWpb = 16;
             using IkpCtx = ::intra_kernel_profiler::trace::WarpContext<kIkpCap, kIkpWpb>;
             IkpCtx ikp_ctx;
             ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof{
@@ -464,7 +457,7 @@ public:
                 int const bidb = get<2>(block_coord);
 #ifdef FLASH_ATTENTION_ENABLE_IKP
                 uint16_t ikp_rid = ikp_region_id(/*producer=*/false, bidb, get<1>(block_coord), get<3>(block_coord));
-                IKP_TRACE_REC_B(ikp_ctx, ikp_prof, ikp_rid);
+                IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_rid, 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0));
 #endif
                 SeqlenInfo_t seqlen_info{
                     bidb,
@@ -506,28 +499,44 @@ public:
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+                #define IKP_MMA_ARGS , (void*)&ikp_ctx, ikp_prof, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord)
+#else
+                #define IKP_MMA_ARGS
+#endif
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage IKP_MMA_ARGS);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage IKP_MMA_ARGS);
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
                     }
                 }
+                #undef IKP_MMA_ARGS
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+                #define KERN_REC_B(ph) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_region_id(false, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord), (ph)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+                #define KERN_REC_E(ph) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_region_id(false, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord), (ph)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+#else
+                #define KERN_REC_B(ph)
+                #define KERN_REC_E(ph)
+#endif
                 // Do this here before the epilogue so that the next tile is ready to go.
+                KERN_REC_B(IKP_PHASE_SCHED);
                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                KERN_REC_E(IKP_PHASE_SCHED);
                 if constexpr (Split && Varlen) {
                     if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
                         cutlass::arch::launch_dependent_grids();
                     }
                 }
+                KERN_REC_B(IKP_PHASE_EPILOGUE);
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
@@ -536,8 +545,11 @@ public:
                     // Write 0 to gO and -inf to gLSE.
                     epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
+                KERN_REC_E(IKP_PHASE_EPILOGUE);
+                #undef KERN_REC_B
+                #undef KERN_REC_E
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-                IKP_TRACE_REC_E(ikp_ctx, ikp_prof, ikp_rid);
+                IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_rid, 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0));
 #endif
             }
             epilogue.store_tail();

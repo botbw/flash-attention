@@ -24,6 +24,11 @@
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+#include <intra_kernel_profiler/trace/trace.cuh>
+#include "ikp_region.h"   // flash::ikp_region_id (shared w/ flash_fwd_kernel_sm90.h)
+#endif
+
 namespace flash {
 
 using namespace cute;
@@ -626,7 +631,22 @@ struct CollectiveMainloopFwdSm90 {
          SeqlenInfo_t const& seqlen_info,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+         , void* ikp_ctx_v, ::intra_kernel_profiler::trace::GlobalBuffer ikp_gbuf,
+         int ikp_bidb, int ikp_head, int ikp_split
+#endif
          ) {
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+        using IkpCtxLd = ::intra_kernel_profiler::trace::WarpContext<32768, 16>;
+        IkpCtxLd& ikp_ctx = *reinterpret_cast<IkpCtxLd*>(ikp_ctx_v);
+        // producer (load) sub-phases — producer flag set so host shows "ld_*".
+        // only the producer warp-leader (thread 0) records (cond below).
+        #define LD_REC_B(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(true, ikp_bidb, ikp_head, ikp_split, (phase)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+        #define LD_REC_E(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(true, ikp_bidb, ikp_head, ikp_split, (phase)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+#else
+        #define LD_REC_B(phase)
+        #define LD_REC_E(phase)
+#endif
 
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
@@ -785,7 +805,8 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            pipeline_k.producer_acquire(smem_pipe_write);
+            LD_REC_B(IKP_PHASE_PIPE_K_ACQ); pipeline_k.producer_acquire(smem_pipe_write); LD_REC_E(IKP_PHASE_PIPE_K_ACQ);  // ld_k_acq: wait empty K slot (pairs w/ consumer krel)
+            LD_REC_B(IKP_PHASE_TMA_K_ISSUE);   // ld_k_tma: K TMA / cp.async issue (+commit)
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
@@ -795,11 +816,13 @@ struct CollectiveMainloopFwdSm90 {
                 paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
                 pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
+            LD_REC_E(IKP_PHASE_TMA_K_ISSUE);
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
-            pipeline_v_load.producer_acquire(smem_pipe_write);
+            LD_REC_B(IKP_PHASE_PIPE_V_ACQ); pipeline_v_load.producer_acquire(smem_pipe_write); LD_REC_E(IKP_PHASE_PIPE_V_ACQ);  // ld_v_acq: wait empty V slot (pairs w/ consumer vrel)
+            LD_REC_B(IKP_PHASE_TMA_V_ISSUE);   // ld_v_tma: V TMA / cp.async issue (+commit)
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
@@ -809,6 +832,7 @@ struct CollectiveMainloopFwdSm90 {
                 paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
                 pipeline_v_load.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
+            LD_REC_E(IKP_PHASE_TMA_V_ISSUE);
         };
 
         auto copy_Vt_to_V = [&] (auto const& smem_pipe_write) {
@@ -887,7 +911,7 @@ struct CollectiveMainloopFwdSm90 {
         // Need ClusterBarrier, not just NamedBarrier. Otherwise we might have CTA 0 finishing the
         // TMA store on O first, call TMA multicast load on V, before CTA 1 can finishing TMA store on O.
         // if (thread_idx == 0) { printf("Producer: main load, before barrier_O, work_idx = %d\n", work_idx);}
-        shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
+        LD_REC_B(IKP_PHASE_PIPE_O_ACQ); shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2); LD_REC_E(IKP_PHASE_PIPE_O_ACQ);  // ld_owait: wait for consumers to free O smem
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
         if constexpr (!Transpose_V && !IntraWGOverlap) {
@@ -926,6 +950,8 @@ struct CollectiveMainloopFwdSm90 {
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
+        #undef LD_REC_B
+        #undef LD_REC_E
     }
 
     template <typename SharedStorage>
@@ -1001,7 +1027,25 @@ struct CollectiveMainloopFwdSm90 {
         SeqlenInfo_t const& seqlen_info,
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+        , void* ikp_ctx_v, ::intra_kernel_profiler::trace::GlobalBuffer ikp_gbuf,
+        int ikp_bidb, int ikp_head, int ikp_split
+#endif
         ) {
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+        // Per-phase nested spans (must match kernel kIkpCap/kIkpWpb = 16384/16).
+        using IkpCtxMma = ::intra_kernel_profiler::trace::WarpContext<32768, 16>;
+        IkpCtxMma& ikp_ctx = *reinterpret_cast<IkpCtxMma*>(ikp_ctx_v);
+        // Phase tags (IKP_PHASE_* in ikp_region.h). MMA_REC_B/E bracket a region;
+        // the host pairs B/E per warp into a span tagged with that phase. Only the
+        // warpgroup leader (thread %128==0) records -> the 4 warps of a WG are
+        // identical, so this cuts trace size ~4x with no info loss.
+        #define MMA_REC_B(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(false, ikp_bidb, ikp_head, ikp_split, (phase)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+        #define MMA_REC_E(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(false, ikp_bidb, ikp_head, ikp_split, (phase)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+#else
+        #define MMA_REC_B(phase)
+        #define MMA_REC_E(phase)
+#endif
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -1167,7 +1211,7 @@ struct CollectiveMainloopFwdSm90 {
 
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
         if constexpr (!AppendKV) {
-            barrier_Q.wait(work_idx % 2);
+            MMA_REC_B(IKP_PHASE_TMA_Q_SYNC); barrier_Q.wait(work_idx % 2); MMA_REC_E(IKP_PHASE_TMA_Q_SYNC);
         } else {
             if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
                 using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreadsQK, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
@@ -1211,29 +1255,33 @@ struct CollectiveMainloopFwdSm90 {
 
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
-            consumer_wait(pipeline_k, smem_pipe_read);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-            warpgroup_wait<0>();
-            pipeline_k.consumer_release(smem_pipe_read);
+            MMA_REC_B(IKP_PHASE_TMA_K_SYNC); consumer_wait(pipeline_k, smem_pipe_read); MMA_REC_E(IKP_PHASE_TMA_K_SYNC);
+            MMA_REC_B(IKP_PHASE_WGMMA_QK_ISSUE); flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS); MMA_REC_E(IKP_PHASE_WGMMA_QK_ISSUE);  // prologue QK launch
+            MMA_REC_B(IKP_PHASE_WGMMA_QK_SYNC); warpgroup_wait<0>(); MMA_REC_E(IKP_PHASE_WGMMA_QK_SYNC);   // prologue QK WGMMA sync
+            MMA_REC_B(IKP_PHASE_PIPE_K_REL); pipeline_k.consumer_release(smem_pipe_read); MMA_REC_E(IKP_PHASE_PIPE_K_REL);
             if constexpr (HasQv) {
-                shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
-                consumer_wait(pipeline_v, smem_pipe_read);
+                MMA_REC_B(IKP_PHASE_TMA_Q_SYNC); shared_storage.pipelines.barrier_Qv.wait(work_idx % 2); MMA_REC_E(IKP_PHASE_TMA_Q_SYNC);
+                MMA_REC_B(IKP_PHASE_TMA_V_SYNC); consumer_wait(pipeline_v, smem_pipe_read); MMA_REC_E(IKP_PHASE_TMA_V_SYNC);
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
             scoremod_premask_fn(tSrS);
-            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            MMA_REC_B(IKP_PHASE_MASK); mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); MMA_REC_E(IKP_PHASE_MASK);
 
+            MMA_REC_B(IKP_PHASE_SOFTMAX);
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
 
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            MMA_REC_E(IKP_PHASE_SOFTMAX);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
             if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+            MMA_REC_B(IKP_PHASE_P_WRITE);
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+            MMA_REC_E(IKP_PHASE_P_WRITE);
             --n_block;
 
             // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
@@ -1246,38 +1294,42 @@ struct CollectiveMainloopFwdSm90 {
                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 ++smem_pipe_read;
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
-                if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
-                warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                MMA_REC_B(IKP_PHASE_TMA_K_SYNC); if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); } MMA_REC_E(IKP_PHASE_TMA_K_SYNC);
+                MMA_REC_B(IKP_PHASE_WGSCHED_SYNC); warp_scheduler_barrier_sync(); MMA_REC_E(IKP_PHASE_WGSCHED_SYNC);
+                MMA_REC_B(IKP_PHASE_WGMMA_QK_ISSUE); flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS); MMA_REC_E(IKP_PHASE_WGMMA_QK_ISSUE);  // QK launch
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr(!HasQv) {
-                    if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
+                    MMA_REC_B(IKP_PHASE_TMA_V_SYNC); if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); } MMA_REC_E(IKP_PHASE_TMA_V_SYNC);
                 }
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                MMA_REC_B(IKP_PHASE_WGMMA_PV_ISSUE); flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO); MMA_REC_E(IKP_PHASE_WGMMA_PV_ISSUE);  // PV launch
                 warp_scheduler_barrier_arrive();
-                warpgroup_wait<1>();
-                pipeline_k.consumer_release(smem_pipe_read);  // release K
+                MMA_REC_B(IKP_PHASE_WGMMA_QK_SYNC); warpgroup_wait<1>(); MMA_REC_E(IKP_PHASE_WGMMA_QK_SYNC);   // QK WGMMA completion
+                MMA_REC_B(IKP_PHASE_PIPE_K_REL); pipeline_k.consumer_release(smem_pipe_read); MMA_REC_E(IKP_PHASE_PIPE_K_REL);  // release K
                 if constexpr (HasQv) {
-                    warpgroup_wait<0>();
-                    pipeline_v.consumer_release(smem_pipe_read_v);  // release V
-                    consumer_wait(pipeline_v, smem_pipe_read);
+                    MMA_REC_B(IKP_PHASE_WGMMA_PV_SYNC); warpgroup_wait<0>(); MMA_REC_E(IKP_PHASE_WGMMA_PV_SYNC);
+                    MMA_REC_B(IKP_PHASE_PIPE_V_REL); pipeline_v.consumer_release(smem_pipe_read_v); MMA_REC_E(IKP_PHASE_PIPE_V_REL);  // release V
+                    MMA_REC_B(IKP_PHASE_TMA_V_SYNC); consumer_wait(pipeline_v, smem_pipe_read); MMA_REC_E(IKP_PHASE_TMA_V_SYNC);
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
                 }
                 scoremod_premask_fn(tSrS);
-                mask_fn(tSrS, n_block);
+                MMA_REC_B(IKP_PHASE_MASK); mask_fn(tSrS, n_block); MMA_REC_E(IKP_PHASE_MASK);
+                MMA_REC_B(IKP_PHASE_SOFTMAX);
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+                MMA_REC_E(IKP_PHASE_SOFTMAX);
                 if constexpr (!HasQv) {
-                    warpgroup_wait<0>();
-                    pipeline_v.consumer_release(smem_pipe_read_v);  // release V
+                    MMA_REC_B(IKP_PHASE_WGMMA_PV_SYNC); warpgroup_wait<0>(); MMA_REC_E(IKP_PHASE_WGMMA_PV_SYNC);   // PV WGMMA completion
+                    MMA_REC_B(IKP_PHASE_PIPE_V_REL); pipeline_v.consumer_release(smem_pipe_read_v); MMA_REC_E(IKP_PHASE_PIPE_V_REL);  // release V
                 }
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
+                MMA_REC_B(IKP_PHASE_P_WRITE);
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+                MMA_REC_E(IKP_PHASE_P_WRITE);
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
@@ -1324,18 +1376,18 @@ struct CollectiveMainloopFwdSm90 {
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
-            if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            MMA_REC_B(IKP_PHASE_TMA_V_SYNC); if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); } MMA_REC_E(IKP_PHASE_TMA_V_SYNC);
+            MMA_REC_B(IKP_PHASE_WGMMA_PV_ISSUE); flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO); MMA_REC_E(IKP_PHASE_WGMMA_PV_ISSUE);  // epilogue PV launch
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             // cute::copy(softmax.finalize(v_descale), scores_scale);
-            finalize_dispatch(scores_scale, v_descale);
+            MMA_REC_B(IKP_PHASE_FINALIZE); finalize_dispatch(scores_scale, v_descale); MMA_REC_E(IKP_PHASE_FINALIZE);
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
-            warpgroup_wait<0>();
-            pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
+            MMA_REC_B(IKP_PHASE_WGMMA_PV_SYNC); warpgroup_wait<0>(); MMA_REC_E(IKP_PHASE_WGMMA_PV_SYNC);   // final PV WGMMA completion
+            MMA_REC_B(IKP_PHASE_PIPE_V_REL); pipeline_v.consumer_release(smem_pipe_read); MMA_REC_E(IKP_PHASE_PIPE_V_REL);  // release V
             softmax.rescale_o(tOrO, scores_scale);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
@@ -1445,6 +1497,8 @@ struct CollectiveMainloopFwdSm90 {
         }
         ++work_idx;
         return true;
+        #undef MMA_REC_B
+        #undef MMA_REC_E
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
