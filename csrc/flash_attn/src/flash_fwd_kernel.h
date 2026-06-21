@@ -30,6 +30,40 @@ namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
+#ifdef FLASH_ATTENTION_ENABLE_IKP
+// ---- FA2 per-phase IKP instrumentation (regular SM80 mainloop) -------------
+// One WarpContext per CTA, recorded on warp 0 only. Region id packs a 5-bit
+// phase field so each bubble in the trace maps to a named mainloop op:
+//   bits10-14 phase | bits5-9 bidb(<=31) | bits2-4 head(<=7) | bits0-1 mblk_low
+// The regular hdim128 A100 kernel launches 128 threads (4 warps) -> WPB=4.
+static constexpr uint32_t kFa2IkpCap = 512;   // per-warp events (per-iteration tagging)
+static constexpr uint32_t kFa2IkpWpb = 4;     // warps/block of the regular kernel
+using Fa2IkpCtx = ::intra_kernel_profiler::trace::WarpContext<kFa2IkpCap, kFa2IkpWpb>;
+enum Fa2IkpPhase {
+    FA2P_TILE = 0, FA2P_PROLOGUE = 1, FA2P_CP_K_WAIT = 2, FA2P_GEMM_QK = 3,
+    FA2P_MASK = 4, FA2P_SOFTMAX = 5, FA2P_CP_V_WAIT = 6, FA2P_GEMM_PV = 7,
+    FA2P_EPILOGUE = 8,
+};
+__forceinline__ __device__ uint16_t fa2_ikp_base(int bidb, int bidh, int mblk) {
+    return (uint16_t)(((uint32_t(bidb) & 0x1Fu) << 5)
+                      | ((uint32_t(bidh) & 0x7u) << 2)
+                      | (uint32_t(mblk) & 0x3u));
+}
+// record on warp 0, lane 0 only (IKP_TRACE_REC_IF already gates lane 0).
+#define FA2_PHB(p) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, \
+    (uint16_t)(ikp_base | (uint16_t(p) << 10)), 0, threadIdx.x < 32)
+#define FA2_PHE(p) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, \
+    (uint16_t)(ikp_base | (uint16_t(p) << 10)), 1, threadIdx.x < 32)
+#define FA2_IKP_MAINLOOP_PARAMS , Fa2IkpCtx &ikp_ctx, \
+    ::intra_kernel_profiler::trace::GlobalBuffer &ikp_prof, const uint16_t ikp_base
+#define FA2_IKP_MAINLOOP_ARGS , ikp_ctx, ikp_prof, ikp_base
+#else
+#define FA2_PHB(p)
+#define FA2_PHE(p)
+#define FA2_IKP_MAINLOOP_PARAMS
+#define FA2_IKP_MAINLOOP_ARGS
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
@@ -54,7 +88,7 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
+inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block FA2_IKP_MAINLOOP_PARAMS) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -250,6 +284,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // Prologue
+    FA2_PHB(FA2P_PROLOGUE);
 
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
@@ -303,12 +338,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int n_masking_steps = (!Is_causal && !Is_local)
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+    FA2_PHE(FA2P_PROLOGUE);
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
+        FA2_PHB(FA2P_CP_K_WAIT);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        FA2_PHE(FA2P_CP_K_WAIT);
 
         // Advance gV
         if (masking_step > 0) {
@@ -321,6 +359,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         cute::cp_async_fence();
 
+        FA2_PHB(FA2P_GEMM_QK);
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -330,12 +369,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
+        FA2_PHE(FA2P_GEMM_QK);
+        FA2_PHB(FA2P_MASK);
         mask.template apply_mask<Is_causal, Is_even_MN>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
+        FA2_PHE(FA2P_MASK);
+        FA2_PHB(FA2P_CP_V_WAIT);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        FA2_PHE(FA2P_CP_V_WAIT);
         if (n_block > n_block_min) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
@@ -344,10 +388,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
+        FA2_PHB(FA2P_SOFTMAX);
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
+        FA2_PHE(FA2P_SOFTMAX);
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
@@ -369,9 +415,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
+        FA2_PHB(FA2P_GEMM_PV);
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
+        FA2_PHE(FA2P_GEMM_PV);
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
             --n_block;
@@ -383,11 +431,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
+        FA2_PHB(FA2P_CP_K_WAIT);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        FA2_PHE(FA2P_CP_K_WAIT);
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
+        FA2_PHB(FA2P_GEMM_QK);
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -396,8 +447,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
+        FA2_PHE(FA2P_GEMM_QK);
+        FA2_PHB(FA2P_CP_V_WAIT);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        FA2_PHE(FA2P_CP_V_WAIT);
         if (n_block > n_block_min) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
@@ -405,12 +459,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             cute::cp_async_fence();
         }
 
+        FA2_PHB(FA2P_MASK);
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
+        FA2_PHE(FA2P_MASK);
+        FA2_PHB(FA2P_SOFTMAX);
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
+        FA2_PHE(FA2P_SOFTMAX);
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
@@ -430,11 +488,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+        FA2_PHB(FA2P_GEMM_PV);
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        FA2_PHE(FA2P_GEMM_PV);
     }
 
     // Epilogue
 
+    FA2_PHB(FA2P_EPILOGUE);
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16/bf16
@@ -496,6 +557,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
+    FA2_PHE(FA2P_EPILOGUE);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1109,29 +1171,23 @@ inline __device__ void compute_attn(const Params &params) {
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-    // [IKP] one span per CTA = one (seq, head, m_block) query-tile of the REGULAR
-    // (non-split) prefill kernel.  Region id packs bidb<<14 | head<<9 | m_block
-    // (2-bit batch, 5-bit head, 9-bit m_block) so the causal-triangle work
-    // profile and the m-fastest dispatch order are recoverable from the trace.
-    static constexpr uint32_t kIkpCap = 8;
-    static constexpr uint32_t kIkpWpb = 8;
-    using IkpCtx = ::intra_kernel_profiler::trace::WarpContext<kIkpCap, kIkpWpb>;
-    IkpCtx ikp_ctx;
+    // [IKP] per-phase trace of the REGULAR (non-split) mainloop.  One WarpContext
+    // per CTA (warp 0), with nested phase spans inside compute_attn_1rowblock.
+    // Region id: phase<<10 | bidb(5b)<<5 | head(3b)<<2 | m_block_low(2b).
+    Fa2IkpCtx ikp_ctx;
     ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof{
         reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
         params.ikp_counters};
-    const uint16_t ikp_rid = (uint16_t)(((uint32_t(bidb) & 0x3u) << 14)
-                                        | ((uint32_t(bidh) & 0x1Fu) << 9)
-                                        | (uint32_t(m_block) & 0x1FFu));
+    const uint16_t ikp_base = fa2_ikp_base(bidb, bidh, m_block);
     if (params.ikp_events != nullptr) {
         IKP_TRACE_CTX_INIT(ikp_ctx);
-        IKP_TRACE_REC_B(ikp_ctx, ikp_prof, ikp_rid);
+        FA2_PHB(FA2P_TILE);
     }
 #endif
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block FA2_IKP_MAINLOOP_ARGS);
 #ifdef FLASH_ATTENTION_ENABLE_IKP
     if (params.ikp_events != nullptr) {
-        IKP_TRACE_REC_E(ikp_ctx, ikp_prof, ikp_rid);
+        FA2_PHE(FA2P_TILE);
         IKP_TRACE_CTX_FLUSH(ikp_ctx, ikp_prof);
     }
 #endif
