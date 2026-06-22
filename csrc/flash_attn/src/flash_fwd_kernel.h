@@ -40,9 +40,9 @@ static constexpr uint32_t kFa2IkpCap = 512;   // per-warp events (per-iteration 
 static constexpr uint32_t kFa2IkpWpb = 4;     // warps/block of the regular kernel
 using Fa2IkpCtx = ::intra_kernel_profiler::trace::WarpContext<kFa2IkpCap, kFa2IkpWpb>;
 enum Fa2IkpPhase {
-    FA2P_TILE = 0, FA2P_PROLOGUE = 1, FA2P_CP_K_WAIT = 2, FA2P_GEMM_QK = 3,
-    FA2P_MASK = 4, FA2P_SOFTMAX = 5, FA2P_CP_V_WAIT = 6, FA2P_GEMM_PV = 7,
-    FA2P_EPILOGUE = 8,
+    FA2P_TILE = 0, FA2P_PROLOGUE = 1, FA2P_CP_K_SYNC = 2, FA2P_GEMM_QK = 3,
+    FA2P_MASK = 4, FA2P_SOFTMAX = 5, FA2P_CP_V_SYNC = 6, FA2P_GEMM_PV = 7,
+    FA2P_EPILOGUE = 8, FA2P_CP_K_ISSUE = 9, FA2P_CP_V_ISSUE = 10,
 };
 __forceinline__ __device__ uint16_t fa2_ikp_base(int bidb, int bidh, int mblk) {
     return (uint16_t)(((uint32_t(bidb) & 0x1Fu) << 5)
@@ -343,11 +343,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
-        FA2_PHB(FA2P_CP_K_WAIT);
+        FA2_PHB(FA2P_CP_K_SYNC);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
-        FA2_PHE(FA2P_CP_K_WAIT);
+        FA2_PHE(FA2P_CP_K_SYNC);
 
+        FA2_PHB(FA2P_CP_V_ISSUE);
         // Advance gV
         if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
@@ -358,6 +359,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             );
         }
         cute::cp_async_fence();
+        FA2_PHE(FA2P_CP_V_ISSUE);
 
         FA2_PHB(FA2P_GEMM_QK);
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
@@ -376,15 +378,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         );
 
         FA2_PHE(FA2P_MASK);
-        FA2_PHB(FA2P_CP_V_WAIT);
+        FA2_PHB(FA2P_CP_V_SYNC);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
-        FA2_PHE(FA2P_CP_V_WAIT);
+        FA2_PHE(FA2P_CP_V_SYNC);
         if (n_block > n_block_min) {
+            FA2_PHB(FA2P_CP_K_ISSUE);
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
+            FA2_PHE(FA2P_CP_K_ISSUE);
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -431,12 +435,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
-        FA2_PHB(FA2P_CP_K_WAIT);
+        FA2_PHB(FA2P_CP_K_SYNC);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
-        FA2_PHE(FA2P_CP_K_WAIT);
+        FA2_PHE(FA2P_CP_K_SYNC);
+        FA2_PHB(FA2P_CP_V_ISSUE);
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
+        FA2_PHE(FA2P_CP_V_ISSUE);
 
         FA2_PHB(FA2P_GEMM_QK);
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
@@ -448,15 +454,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         FA2_PHE(FA2P_GEMM_QK);
-        FA2_PHB(FA2P_CP_V_WAIT);
+        FA2_PHB(FA2P_CP_V_SYNC);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
-        FA2_PHE(FA2P_CP_V_WAIT);
+        FA2_PHE(FA2P_CP_V_SYNC);
         if (n_block > n_block_min) {
+            FA2_PHB(FA2P_CP_K_ISSUE);
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
+            FA2_PHE(FA2P_CP_K_ISSUE);
         }
 
         FA2_PHB(FA2P_MASK);
