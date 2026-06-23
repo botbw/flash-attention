@@ -49,14 +49,15 @@ __forceinline__ __device__ uint16_t fa2_ikp_base(int bidb, int bidh, int mblk) {
                       | ((uint32_t(bidh) & 0x7u) << 2)
                       | (uint32_t(mblk) & 0x3u));
 }
-// record on warp 0, lane 0 only (IKP_TRACE_REC_IF already gates lane 0).
+// record on warp 0, lane 0 only (IKP_TRACE_REC_IF already gates lane 0), and only
+// if region p is enabled in the runtime mask (per-region overhead sweep).
 #define FA2_PHB(p) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, \
-    (uint16_t)(ikp_base | (uint16_t(p) << 10)), 0, threadIdx.x < 32)
+    (uint16_t)(ikp_base | (uint16_t(p) << 10)), 0, (threadIdx.x < 32) && ((ikp_mask >> (p)) & 1u))
 #define FA2_PHE(p) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, \
-    (uint16_t)(ikp_base | (uint16_t(p) << 10)), 1, threadIdx.x < 32)
+    (uint16_t)(ikp_base | (uint16_t(p) << 10)), 1, (threadIdx.x < 32) && ((ikp_mask >> (p)) & 1u))
 #define FA2_IKP_MAINLOOP_PARAMS , Fa2IkpCtx &ikp_ctx, \
-    ::intra_kernel_profiler::trace::GlobalBuffer &ikp_prof, const uint16_t ikp_base
-#define FA2_IKP_MAINLOOP_ARGS , ikp_ctx, ikp_prof, ikp_base
+    ::intra_kernel_profiler::trace::GlobalBuffer &ikp_prof, const uint16_t ikp_base, const uint32_t ikp_mask
+#define FA2_IKP_MAINLOOP_ARGS , ikp_ctx, ikp_prof, ikp_base, ikp_mask
 #else
 #define FA2_PHB(p)
 #define FA2_PHE(p)
@@ -1187,6 +1188,7 @@ inline __device__ void compute_attn(const Params &params) {
         reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
         params.ikp_counters};
     const uint16_t ikp_base = fa2_ikp_base(bidb, bidh, m_block);
+    const uint32_t ikp_mask = params.ikp_region_mask;
     if (params.ikp_events != nullptr) {
         IKP_TRACE_CTX_INIT(ikp_ctx);
         FA2_PHB(FA2P_TILE);

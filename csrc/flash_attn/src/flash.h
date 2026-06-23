@@ -50,6 +50,9 @@ struct Flash_fwd_params : public Qkv_params {
     // [IKP] intra-kernel profiler global buffers (null when disarmed).
     void * ikp_events = nullptr;
     uint32_t * ikp_counters = nullptr;
+    // [IKP] per-region enable mask (bit p enables phase p). For in-kernel
+    // per-region overhead measurement; default all-on.
+    uint32_t ikp_region_mask = 0xFFFFFFFFu;
 
 
     // The O matrix (output).

@@ -10,9 +10,15 @@ namespace {
     intra_kernel_profiler::trace::HostSession g_fa2_ikp_sess;
     bool g_fa2_ikp_armed = false;
     std::vector<std::string> g_fa2_ikp_region_names;
+    uint32_t g_fa2_ikp_mask = 0xFFFFFFFFu;   // per-region enable mask (host-side)
 }
 
 extern "C" {
+
+// Per-region enable mask (bit p enables phase p), read into params.ikp_region_mask
+// at each launch. For in-kernel per-region overhead sweeps.
+void fa2_ikp_set_mask(uint32_t mask) { g_fa2_ikp_mask = mask; }
+uint32_t fa2_ikp_get_mask() { return g_fa2_ikp_mask; }
 
 // Allocate device buffers and arm IKP.  Call BEFORE the attention call.
 //   per_warp_cap      : events per warp (power of 2; 8 is plenty for FA2 —

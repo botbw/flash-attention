@@ -258,6 +258,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 // need the buffer getter here.
 #ifdef FLASH_ATTENTION_ENABLE_IKP
 extern "C" void fa2_ikp_get_bufs(void** events, uint32_t** counters);
+extern "C" uint32_t fa2_ikp_get_mask();
 #endif
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
@@ -506,6 +507,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
 #ifdef FLASH_ATTENTION_ENABLE_IKP
     fa2_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
+    params.ikp_region_mask = fa2_ikp_get_mask();
 #endif
 
         run_mha_fwd(params, stream);
@@ -757,6 +759,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
 #ifdef FLASH_ATTENTION_ENABLE_IKP
     fa2_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
+    params.ikp_region_mask = fa2_ikp_get_mask();
 #endif
 
         run_mha_fwd(params, stream, paged_KV);
@@ -1513,6 +1516,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
 #ifdef FLASH_ATTENTION_ENABLE_IKP
     fa2_ikp_get_bufs(&params.ikp_events, &params.ikp_counters);
+    params.ikp_region_mask = fa2_ikp_get_mask();
 #endif
 
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
