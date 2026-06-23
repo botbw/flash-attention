@@ -641,8 +641,9 @@ struct CollectiveMainloopFwdSm90 {
         IkpCtxLd& ikp_ctx = *reinterpret_cast<IkpCtxLd*>(ikp_ctx_v);
         // producer (load) sub-phases — producer flag set so host shows "ld_*".
         // only the producer warp-leader (thread 0) records (cond below).
-        #define LD_REC_B(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(true, ikp_bidb, ikp_head, ikp_split, (phase)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
-        #define LD_REC_E(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(true, ikp_bidb, ikp_head, ikp_split, (phase)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+        // producer phases gated by mask bits (phase+24) to stay separable from consumer bits.
+        #define LD_REC_B(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(true, ikp_bidb, ikp_head, ikp_split, (phase)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0) && ((ikp_gbuf.region_mask >> ((phase)+24)) & 1u))
+        #define LD_REC_E(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(true, ikp_bidb, ikp_head, ikp_split, (phase)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0) && ((ikp_gbuf.region_mask >> ((phase)+24)) & 1u))
 #else
         #define LD_REC_B(phase)
         #define LD_REC_E(phase)
@@ -1040,8 +1041,8 @@ struct CollectiveMainloopFwdSm90 {
         // the host pairs B/E per warp into a span tagged with that phase. Only the
         // warpgroup leader (thread %128==0) records -> the 4 warps of a WG are
         // identical, so this cuts trace size ~4x with no info loss.
-        #define MMA_REC_B(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(false, ikp_bidb, ikp_head, ikp_split, (phase)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
-        #define MMA_REC_E(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(false, ikp_bidb, ikp_head, ikp_split, (phase)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+        #define MMA_REC_B(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(false, ikp_bidb, ikp_head, ikp_split, (phase)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0) && ((ikp_gbuf.region_mask >> (phase)) & 1u))
+        #define MMA_REC_E(phase) IKP_TRACE_REC_IF(ikp_ctx, ikp_gbuf, flash::ikp_region_id(false, ikp_bidb, ikp_head, ikp_split, (phase)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0) && ((ikp_gbuf.region_mask >> (phase)) & 1u))
 #else
         #define MMA_REC_B(phase)
         #define MMA_REC_E(phase)

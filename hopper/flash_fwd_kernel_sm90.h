@@ -136,6 +136,7 @@ public:
 #ifdef FLASH_ATTENTION_ENABLE_IKP
         void*     ikp_events   = nullptr;   // intra_kernel_profiler::trace::Event* device buf
         uint32_t* ikp_counters = nullptr;   // per-(block,warp) circular-buffer counters
+        uint32_t  ikp_region_mask = 0xFFFFFFFFu;  // per-region enable mask (overhead sweep)
 #endif
     };
 
@@ -148,6 +149,7 @@ public:
 #ifdef FLASH_ATTENTION_ENABLE_IKP
         void*     ikp_events   = nullptr;
         uint32_t* ikp_counters = nullptr;
+        uint32_t  ikp_region_mask = 0xFFFFFFFFu;
 #endif
     };
 
@@ -181,6 +183,7 @@ public:
 #ifdef FLASH_ATTENTION_ENABLE_IKP
         p.ikp_events   = args.ikp_events;
         p.ikp_counters = args.ikp_counters;
+        p.ikp_region_mask = args.ikp_region_mask;
 #endif
         return p;
     }
@@ -364,7 +367,7 @@ public:
             IkpCtxP ikp_ctx_p;
             ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof_p{
                 reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
-                params.ikp_counters};
+                params.ikp_counters, params.ikp_region_mask};
             IKP_TRACE_CTX_INIT(ikp_ctx_p);
 #endif
 
@@ -443,7 +446,7 @@ public:
             IkpCtx ikp_ctx;
             ::intra_kernel_profiler::trace::GlobalBuffer ikp_prof{
                 reinterpret_cast<::intra_kernel_profiler::trace::Event*>(params.ikp_events),
-                params.ikp_counters};
+                params.ikp_counters, params.ikp_region_mask};
             IKP_TRACE_CTX_INIT(ikp_ctx);
 #endif
 
@@ -521,8 +524,8 @@ public:
                 }
                 #undef IKP_MMA_ARGS
 #ifdef FLASH_ATTENTION_ENABLE_IKP
-                #define KERN_REC_B(ph) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_region_id(false, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord), (ph)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
-                #define KERN_REC_E(ph) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_region_id(false, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord), (ph)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0))
+                #define KERN_REC_B(ph) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_region_id(false, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord), (ph)), 0, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0) && ((ikp_prof.region_mask >> (ph)) & 1u))
+                #define KERN_REC_E(ph) IKP_TRACE_REC_IF(ikp_ctx, ikp_prof, ikp_region_id(false, get<2>(block_coord), get<1>(block_coord), get<3>(block_coord), (ph)), 1, (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0) && ((ikp_prof.region_mask >> (ph)) & 1u))
 #else
                 #define KERN_REC_B(ph)
                 #define KERN_REC_E(ph)

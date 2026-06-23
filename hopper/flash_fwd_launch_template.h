@@ -8,6 +8,7 @@
 #include <cstdint>  // uint32_t
 // Forward declaration at file scope (defined in flash_prepare_scheduler.cu).
 extern "C" void fa3_ikp_get_bufs(void**, uint32_t**);
+extern "C" uint32_t fa3_ikp_get_mask();
 #endif
 
 #include "cute/tensor.hpp"
@@ -185,6 +186,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 #ifdef FLASH_ATTENTION_ENABLE_IKP
     // Inject IKP device buffer pointers into the kernel arguments before conversion.
     fa3_ikp_get_bufs(&attn_args.ikp_events, &attn_args.ikp_counters);
+    attn_args.ikp_region_mask = fa3_ikp_get_mask();
 #endif
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments(attn_args);
 

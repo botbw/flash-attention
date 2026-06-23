@@ -292,9 +292,17 @@ namespace {
     intra_kernel_profiler::trace::HostSession g_ikp_sess;
     bool g_ikp_armed = false;
     std::vector<std::string> g_ikp_region_names;
+    uint32_t g_ikp_region_mask = 0xFFFFFFFFu;   // per-region enable mask (host-side)
 }
 
 extern "C" {
+
+// Per-region enable mask: consumer phase p -> bit p, producer phase p -> bit (p+24).
+// Read into attn_args.ikp_region_mask at launch (flash_fwd_launch_template.h).
+// For in-kernel per-region overhead sweeps.
+void fa3_ikp_set_mask(uint32_t mask) { g_ikp_region_mask = mask; }
+uint32_t fa3_ikp_get_mask() { return g_ikp_region_mask; }
+
 
 // Allocate device buffers and arm IKP.
 // Must be called BEFORE the kernel launch.
